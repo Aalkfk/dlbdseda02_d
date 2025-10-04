@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.python-version
+
+# Virtual envs
+.venv/
+.venv_x64/
+
+# Jupyter/VSCode
+.ipynb_checkpoints/
+.vscode/
+
+# Env & Secrets
+.env
+*.env
+
+# Data & artifacts
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
