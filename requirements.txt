@@ -1,0 +1,18 @@
+# Core
+numpy~=2.3
+pandas~=2.2
+scikit-learn~=1.7
+matplotlib~=3.9
+pyarrow>=15,<19
+
+# NLP/Topic Modeling
+nltk~=3.9
+spacy~=3.7
+gensim~=4.3
+pyLDAvis~=3.4
+
+# App/IO
+requests~=2.32
+praw~=7.8
+python-dotenv~=1.0
+tqdm~=4.66
