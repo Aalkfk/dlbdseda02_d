@@ -2,44 +2,90 @@ import re
 import pandas as pd
 import nltk
 from nltk.corpus import stopwords
+from nltk.stem.snowball import GermanStemmer
 
-# Lade Stopwörter (Deutsch)
 def _ensure_nltk():
     try:
         _ = stopwords.words("german")
+        _ = stopwords.words("english")
     except LookupError:
         nltk.download("stopwords")
 
 _ensure_nltk()
-GERMAN_SW = set(stopwords.words("german")) | {
-    # Zusatz-Stopwörter, Subreddit-spezifisch erweiterbar
-    "stuttgart", "stgt", "https", "http"
+
+GERMAN_SW = set(stopwords.words("german")) | {"stuttgart", "stgt", "https", "http"}
+ENGLISH_SW = set(stopwords.words("english"))
+
+# Domain-/Füllwörter, die in r/Stuttgart oft nicht themenbildend sind
+FILLER_DE = {
+    "mal","schon","ja","gut","halt","bisschen","eigentlich","irgendwie","wirklich","einfach",
+    "leute","heute","morgen","gerade","immer","mehr","weniger","bzw","uhr","danke","bitte"
 }
+GERMAN_SW |= FILLER_DE
 
 URL_RE = re.compile(r"https?://\S+")
-HASHTAG_RE = re.compile(r"(?i)(?<!\w)#([A-Za-z0-9_äöüÄÖÜß]+)")
+PUNCT_RE = re.compile(r"[^\wäöüÄÖÜß\s]")
+
+STEMMER = GermanStemmer(ignore_stopwords=True)
 
 def clean_text(s: str) -> str:
     s = s or ""
     s = URL_RE.sub(" ", s)
-    s = re.sub(r"[^\wäöüÄÖÜß\s]", " ", s, flags=re.UNICODE)
+    s = PUNCT_RE.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
 def tokenize(text: str):
-    # simpler, robuste Tokenisierung (siehe Kurs: nltk.tokenize & Vektorisierung)
-    return [w for w in re.findall(r"\b[\wäöüÄÖÜß]{2,}\b", text) if w not in GERMAN_SW]
+    return re.findall(r"\b[\wäöüÄÖÜß]{2,}\b", text)
 
-def add_clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+def detect_language_by_stopword_ratio(tokens, min_tokens=12, margin=1.15):
+    """Heuristik: vergleicht Stopwort-Anteile. margin>1 bevorzugt DE, wenn knapp."""
+    if not tokens:
+        return "unknown"
+    n = len(tokens)
+    if n < min_tokens:
+        return "unknown"
+    de_hits = sum(1 for t in tokens if t in GERMAN_SW)
+    en_hits = sum(1 for t in tokens if t in ENGLISH_SW)
+    de_ratio = de_hits / n
+    en_ratio = en_hits / n
+    if de_ratio >= en_ratio * margin and de_ratio > 0:
+        return "de"
+    if en_ratio >= de_ratio * margin and en_ratio > 0:
+        return "en"
+    return "unknown"
+
+def add_clean_columns(df: pd.DataFrame, use_stemming: bool=True, filter_english: bool=True) -> pd.DataFrame:
     df = df.copy()
     df["text_all"] = (df["text"].fillna("") + " " + df["comments_text"].fillna("")).str.strip()
     df["clean"] = df["text_all"].map(clean_text)
-    df["tokens"] = df["clean"].map(tokenize)
+    df["tokens_raw"] = df["clean"].map(tokenize)
+
+    # Sprachheuristik
+    df["lang"] = df["tokens_raw"].map(detect_language_by_stopword_ratio)
+
+    # optional Englisch rausfiltern
+    if filter_english:
+        df = df[df["lang"] != "en"].reset_index(drop=True)
+
+    # Stopwörter entfernen + optional Stemming
+    def _proc(tokens):
+        kept = [t for t in tokens if t not in GERMAN_SW and t not in ENGLISH_SW]
+        if use_stemming:
+            kept = [STEMMER.stem(t) for t in kept]
+        return kept
+
+    df["tokens"] = df["tokens_raw"].map(_proc)
+    # Für Vectorizer
+    df["clean_for_vect"] = df["tokens"].map(lambda ts: " ".join(ts))
     return df
 
-def extract_hashtags(df: pd.DataFrame):
-    tags = []
-    for s in (df["title"].fillna("") + " " + df["selftext"].fillna("")).tolist():
-        tags += [m.lower() for m in HASHTAG_RE.findall(s)]
-    return pd.Series(tags).value_counts()
+def extract_flairs(df: pd.DataFrame) -> pd.Series:
+    """Flair-Stats statt Hashtags."""
+    return (df["flair_text"]
+            .fillna("")
+            .str.strip()
+            .replace({"": None})
+            .dropna()
+            .value_counts())
 
