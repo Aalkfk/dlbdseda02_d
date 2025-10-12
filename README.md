@@ -2,6 +2,9 @@
 
 # Stuttgart Reddit Topic Explorer
 
+**Aufgabenstellung**
+In dieser Aufgabe werden die am häufigsten diskutierten Themen auf Reddit, die das Subreddit /r/Stuttgart betreffen, extrahiert. Du nutzt Python für diese Analyse, indem Du Dich mit der Reddit-API verbindest oder einen bestehenden Datensatz nutzt. Aufgabe: Extrahieren der häufigsten Themen aus Reddit-Nachrichten.
+
 Automatisches Sammeln und Auswerten von Posts aus **r/Stuttgart**: Preprocessing, Topic Modeling (LDA), intelligente Label-Generierung mit Duplikat-Vermeidung und ein moderner **HTML-Report** mit DE/EN-Vergleichen und Statistiken.  
 Der Report zeigt u. a. die aktivsten Flairs und Nutzer:innen, pro Flair die Top-Topics (nebeneinander: DE/EN) sowie ganz unten den gesamten Konsolen-Log.
 
