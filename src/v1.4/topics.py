@@ -7,7 +7,7 @@ from sklearn.decomposition import LatentDirichletAllocation, TruncatedSVD
 def vectorize_counts(texts: List[str], ngram=(1,2), min_df=5, max_df=0.3,
                      max_features: Optional[int]=12000, stop_words=None):
     vec = CountVectorizer(ngram_range=ngram, min_df=min_df, max_df=max_df,
-                          max_features=max_features, stop_words=stop_words, binary=True)
+                          max_features=max_features, stop_words=stop_words)
     X = vec.fit_transform(texts)
     return vec, X
 
@@ -17,15 +17,15 @@ def vectorize_tfidf(texts: List[str], ngram=(1,2), min_df=5, max_df=0.6, stop_wo
     X = vec.fit_transform(texts)
     return vec, X
 
-def lda_from_matrix(X, n_topics=8, max_iter=60, random_state=42, learning_decay=0.7):
+def lda_from_matrix(X, n_topics=8, max_iter=20, random_state=42, learning_decay=0.7):
     lda = LatentDirichletAllocation(
         n_components=n_topics,
-        learning_method="batch",
+        learning_method="online",
         learning_decay=learning_decay,
         max_iter=max_iter,
         random_state=random_state,
-        doc_topic_prior=0.5,
-        topic_word_prior=0.05
+        doc_topic_prior=None,
+        topic_word_prior=None
     )
     doc_topic = lda.fit_transform(X)
     return lda, doc_topic
