@@ -1,8 +1,48 @@
+# main.py
+# -*- coding: utf-8 -*-
+"""
+r/Stuttgart – Themenreport (LDA) mit HTML-Report
+
+Pipeline (high level)
+---------------------
+1) Daten laden (CSV-Cache oder Reddit-API), Grundstatistiken (Top Flairs, Top User).
+2) Für jede vordefinierte "Flair-Run"-Konfiguration:
+   - Preprocessing (Tokenisierung, optionale Kommentar-Einbeziehung, Sprachfilter).
+   - Auto-Stopwörter + manuelle Zusatz-Stopwörter.
+   - Count-Vektorisierung mit robuster Parameterglättung (min_df/max_df-Fenster).
+   - Fallback auf TF-IDF-Keywords bei sehr kleinen Korpora.
+   - LDA für Kandidaten-K und Seeds, Auswahl des besten Modells via Kohärenz.
+   - Lesbare Topic-Labels (Bigramme bevorzugt, Domänen-Bonus) + Label-Deduplikation.
+   - Ausgabe Beispiel-Posts pro Topic (CSV) + präziser Konsolen-Output.
+
+3) Am Ende: Aus dem *Konsolen-Output* wird ein hübscher HTML-Report gebaut
+   (DE/EN-Blöcke nebeneinander, Statistik, vollständiger Roh-Log am Ende).
+
+WICHTIGER KONTRAKT (für den Report-Parser)
+------------------------------------------
+Die HTML-Generierung unten parst **genau** folgende Konsolenzeilen:
+- Abschnittsüberschrift:          "# ==== Themen für Flair: {Name} ===="
+- Vectorizer-Protokoll:           "[Info] Try vectorize: n_docs=... -> features=..."
+- Modell-Zeile (K/Coh/Features):  "[Info] {Name}: K=... Seed=... Coh=... (features=..., min_df=..., ...)"
+- Topic-Zeilen:                   "Topic {rank} (ID {tid}) [Label optional]: {term1}, {term2}, ..."
+
+Diese Strings **nicht** verändern (keine anderen Klammern, keine extra Doppelpunkte usw.),
+sonst versteht der Parser den Log nicht mehr.
+
+Artefakte/Outputs
+-----------------
+- DATA_DIR/top_flairs.csv            – Top-Flairs
+- DATA_DIR/top_users.csv             – Aktive Nutzer
+- DATA_DIR/samples_..._per_topic.csv – Beispielposts pro Topic und Flair-Block
+- DATA_DIR/report.html               – HTML-Report
+"""
+
 from __future__ import annotations
-import sys
+
 import math
 from collections import Counter
 from typing import List, Dict, Tuple, Optional
+
 import pandas as pd
 
 from .fetch import fetch_subreddit_posts
@@ -11,71 +51,98 @@ from .preprocess import (
     clean_text, tokenize, TECHNICAL_SW
 )
 from .topics import (
-    vectorize_counts, vectorize_tfidf,  # TF-IDF nur für evtl. spätere Fallbacks
-    lda_from_matrix, top_terms_per_topic, pick_top_k_topics, umass_coherence
+    vectorize_counts, top_terms_per_topic, pick_top_k_topics, fit_best_lda,
 )
 from .utils import DATA_DIR
 
-# =========================
-# Konfiguration
-# =========================
-RUN_LSA_COMPARE = False  # aus, Fokus: LDA-Stabilität
 
-# Pro-Flair-Modelle (mit flairspezifischen Feineinstellungen)
+# ============================================================================
+# Konfiguration
+# ============================================================================
+
+# Seeds: für Reproduzierbarkeit und robuste Auswahl des LDA-Modells.
+SEEDS = (13, 21, 42, 77)
+
+# Default-Kandidaten für K (Anzahl Topics), wenn pro-Block nichts erzwungen wird.
+DEFAULT_CANDIDATE_K = [6, 8, 10, 12]
+
+# (Derzeit nicht aktiv benutzt – historischer Tuning-Anker für Feature-Bandbreiten.)
+FEAT_TARGET_LOW  = 300
+FEAT_TARGET_HIGH = 2000
+
+# Harte Untergrenze an Features; darunter LDA i. d. R. nicht sinnvoll.
+FEAT_MIN_HARD    = 100
+
+# Pro-Flair Modelle (Block-Konfigurationen).
+# Tipp: Für jeden Block lassen sich Stopwort-Logik, Titelgewichtung, min_tokens,
+#       K-Kandidaten usw. getrennt justieren.
 FLAIR_RUNS = [
-    # Diskussion: mehr Substanz -> Kommentare an, aggressivere Auto-Stopwörter, Extra-Stopwörter
+    # ----------------------------
+    # Diskussion (Deutsch)
+    # ----------------------------
     {"name": "Diskussion - DE",
      "flairs": ["Diskussion"],
      "lang": "de",
-     "filter_english": True,
-     "include_comments": True,    # <— neu: Kommentare an
+     "filter_english": True,   # EN wird schon im Preprocess entfernt
+     "include_comments": True,
      "min_tokens": 20,
-     "title_boost": 1,
+     "title_boost": 1,         # Titel leicht berücksichtigen
      "df_ratio_auto_sw": 0.50,
      "extra_stopwords": {"mal","mehr","einfach","echt","leider","besser","immer","schon",
                          "klar","weiß","gesagt","gemacht","findet","find","sagen"},
-     "feat_min_hard": 80,         # ab hier nicht abbrechen
-     "candidate_k": [6, 8, 10]},
+     "feat_min_hard": 80,
+     "candidate_k": [4, 5, 6]},
 
+    # ----------------------------
+    # Diskussion (Englisch)
+    # ----------------------------
     {"name": "Diskussion - EN",
      "flairs": ["Diskussion"],
      "lang": "en",
-     "filter_english": False,
-     "include_comments": True,    # <— neu: Kommentare an
+     "filter_english": False,  # explizit EN-Doks zulassen
+     "include_comments": True,
      "min_tokens": 10,
-     "title_boost": 2,
+     "title_boost": 2,         # Headlines etwas stärker
      "df_ratio_auto_sw": 0.50,
      "extra_stopwords": {"get","know","like","make","one","people","really","thing","things","would","could","also","still"},
-     "feat_min_hard": 40,         # ab hier nicht abbrechen
-     "candidate_k": [2,3]},
+     "feat_min_hard": 40,
+     "candidate_k": [2]},
 
-    # News: sehr kleiner Korpus -> niedrige Feature-Untergrenze, kleineres K, starker Titel-Boost
+    # ----------------------------
+    # News (Deutsch)
+    # ----------------------------
     {"name": "News - DE",
      "flairs": ["News"],
      "lang": "de",
      "filter_english": True,
-     "include_comments": False,
+     "include_comments": False, # Headlines dominieren, Kommentare oft Rauschen
      "min_tokens": 5,
-     "title_boost": 4,            # <— Headlines stärker gewichten
+     "title_boost": 5,          # Headlines sehr stark gewichten
      "df_ratio_auto_sw": 0.50,
      "extra_stopwords": {"mal","mehr","letzte","letzten","schon"},
-     "feat_min_hard": 40,         # <— nicht mehr abbrechen bei ~33 Features
-     "candidate_k": [3, 4],   # <— kleines K
+     "feat_min_hard": 40,
+     "candidate_k": [3],
+     # Enges (min_df, max_df)-Fenster für kleine, headline-lastige Korpora
      "pairs": [(3, 0.60), (3, 1.00), (2, 0.60)]},
 
+    # ----------------------------
+    # News (Englisch)
+    # ----------------------------
     {"name": "News - EN",
      "flairs": ["News"],
      "lang": "en",
      "filter_english": False,
      "include_comments": False,
      "min_tokens": 8,
-     "title_boost": 3,
+     "title_boost": 5,
      "df_ratio_auto_sw": 0.50,
      "extra_stopwords": {"get","know","like","make","one","people","really","thing","things","would","could","also","still"},
-     "feat_min_hard": 30,         # ab hier nicht abbrechen
-     "candidate_k": [2,3]},
+     "feat_min_hard": 30,
+     "candidate_k": [2, 3]},
 
-    # Events: unverändert, aber mit parametrischem Slot
+    # ----------------------------
+    # Events (Deutsch)
+    # ----------------------------
     {"name": "Events - DE",
      "flairs": ["Events"],
      "lang": "de",
@@ -85,9 +152,12 @@ FLAIR_RUNS = [
      "title_boost": 2,
      "df_ratio_auto_sw": 0.60,
      "extra_stopwords": {"post", "infos", "weitere", "weitere informationen"},
-     "feat_min_hard": 80,         # Standard
-     "candidate_k": [6, 8, 10]},        # None => Default-Kandidaten
-    
+     "feat_min_hard": 80,
+     "candidate_k": [3, 4, 5]},
+
+    # ----------------------------
+    # Events (Englisch)
+    # ----------------------------
     {"name": "Events - EN",
      "flairs": ["Events"],
      "lang": "en",
@@ -97,10 +167,12 @@ FLAIR_RUNS = [
      "title_boost": 2,
      "df_ratio_auto_sw": 0.50,
      "extra_stopwords": {"get","know","like","make","one","people","really","thing","things","would","could","also","still"},
-     "feat_min_hard": 30,         # ab hier nicht abbrechen
-     "candidate_k": [2,3]},
+     "feat_min_hard": 30,
+     "candidate_k": [2, 3]},
 
-    # Frage/Advice: Kommentare an (mehr Inhalt), sonst wie gehabt
+    # ----------------------------
+    # Frage/Advice (Deutsch)
+    # ----------------------------
     {"name": "Frage/Advice - DE",
      "flairs": ["Frage / Advice", "Looking for..."],
      "lang": "de",
@@ -111,8 +183,11 @@ FLAIR_RUNS = [
      "df_ratio_auto_sw": 0.60,
      "extra_stopwords": {"mal","mehr","einfach","schon","leider","eigentlich"},
      "feat_min_hard": 80,
-     "candidate_k": [8, 10]},
+     "candidate_k": [5, 6]},
 
+    # ----------------------------
+    # Frage/Advice (Englisch)
+    # ----------------------------
     {"name": "Frage/Advice - EN",
      "flairs": ["Frage / Advice", "Looking for..."],
      "lang": "en",
@@ -122,28 +197,33 @@ FLAIR_RUNS = [
      "title_boost": 1,
      "df_ratio_auto_sw": 0.50,
      "extra_stopwords": {"get","know","like","make","one","people","really","thing","things","would","could","also","still"},
-     "feat_min_hard": 40,         # ab hier nicht abbrechen
-     "candidate_k": [2,3]}
+     "feat_min_hard": 40,
+     "candidate_k": [2, 3]},
 ]
 
-# Default-Kandidaten für Anzahl Topics und Seeds
-DEFAULT_CANDIDATE_K = [6, 8, 10, 12]
-SEEDS = (13, 21, 42, 77)
 
-# Zielbereich für Anzahl Features (soft window)
-FEAT_TARGET_LOW  = 300
-FEAT_TARGET_HIGH = 2000
-FEAT_MIN_HARD    = 100  # globale harte Untergrenze (kann pro Flair übersteuert werden)
+# ============================================================================
+# Hilfsfunktionen (Vektorisierung, Heuristiken, Labeling)
+# ============================================================================
 
-# =========================
-# Hilfsfunktionen
-# =========================
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+
 def _fallback_keywords(texts: List[str], stop_words_norm, top_n: int = 12):
-    """Einfache Fallback-Keyword-Liste, wenn LDA wegen kleinem Korpus nicht sinnvoll ist."""
+    """
+    Fallback-Schritt für sehr kleine Korpora:
+    Ermittelt einfache TF-IDF-Bigramm-Keywords, wenn LDA keinen Sinn ergibt.
+
+    Args:
+        texts: Liste der vektorisierten Texte (Strings).
+        stop_words_norm: normalisierte Stopwortliste (so wie an Vectorizer übergeben).
+        top_n: Anzahl zu zeigender Keywords.
+
+    Side effects:
+        Druckt eine Zeile "Fallback-Keywords: kw1, kw2, ..." in die Konsole.
+    """
     try:
-        vec = TfidfVectorizer(ngram_range=(2,2), min_df=1, max_df=0.95, stop_words=stop_words_norm)
+        vec = TfidfVectorizer(ngram_range=(2, 2), min_df=1, max_df=0.95, stop_words=stop_words_norm)
         X = vec.fit_transform(texts)
         if X.shape[1] == 0:
             print("[Fallback] Keine Keywords ermittelbar.")
@@ -157,38 +237,55 @@ def _fallback_keywords(texts: List[str], stop_words_norm, top_n: int = 12):
 
 
 def _infer_lang_from_tokens(tokens):
+    """
+    Sehr einfache Sprachheuristik auf Token-Basis (DE/EN/unk),
+    verwendet Treffermengen der jeweils anderen Stopwortliste.
+
+    Returns:
+        "de" | "en" | "unk"
+    """
     if not tokens:
         return "unk"
     de_hits = sum((t in GERMAN_SW) for t in tokens)
     en_hits = sum((t in ENGLISH_SW) for t in tokens)
-    # klare Mehrheiten; kleine Mindestschwelle gegen Zufallstreffer
     if en_hits >= max(2, de_hits + 1):
         return "en"
     if de_hits >= max(2, en_hits + 1):
         return "de"
-    # unklar
     return "unk"
 
 
 def _normalize_stopwords(stopset: set[str]) -> List[str]:
+    """
+    Normalisiert Stopwörter durch clean_text/tokenize (z. B. Mehrwortbegriffe -> Tokens).
+    Gibt eine Liste zurück, die direkt in Vectorizer.stop_words passt.
+    """
     norm = set()
     for w in stopset:
         toks = tokenize(clean_text(w))
         norm.update(toks)
     return sorted({t for t in norm if len(t) >= 2})
 
+
 def _build_texts_with_title_boost(df: pd.DataFrame, title_boost: int) -> List[str]:
+    """
+    Erzeugt pro Dokument den Vektorisierungs-Text:
+      clean_for_vect + (Titel-Tokens * title_boost)
+    Entfernt zusätzlich Unterstriche in Collocations.
+
+    Achtung: Reihenfolge und Tokenisierung muss kompatibel zur Vektorisierung bleiben.
+    """
     base = df["clean_for_vect"].fillna("")
     if title_boost <= 0 or "title" not in df.columns:
         texts = base
     else:
         title_tokens = (
-            df["title"].fillna("")
-            .map(clean_text).map(tokenize).map(lambda ts: " ".join(ts))
+            df["title"].fillna("").map(clean_text).map(tokenize).map(lambda ts: " ".join(ts))
         )
         title_boost_str = title_tokens.map(lambda s: (s + " ") * title_boost)
         texts = (base + " " + title_boost_str).str.strip()
-    # NEU: Unterstriche aus evtl. Collocations entfernen
+
+    # Collocations: "_" -> " ", Duplikat-Leerzeichen entfernen
     texts = texts.str.replace("_", " ", regex=False).str.replace(r"\s+", " ", regex=True).str.strip()
     return texts.tolist()
 
@@ -197,48 +294,50 @@ def _auto_stopwords_from_tokens(tokens_list: List[List[str]],
                                 df_ratio: float = 0.70,
                                 top_n_cap: int = 60,
                                 whitelist: Optional[set] = None) -> set:
+    """
+    Heuristik: Alle Tokens, die in >= df_ratio Dokumenten vorkommen (bis top_n_cap),
+    werden als Auto-Stopwörter vorgeschlagen – außer sie sind whitelisted/Domänenwörter.
+
+    Args:
+        tokens_list: Liste Tokenlisten je Dokument.
+        df_ratio: Dokumentfrequenz-Schwelle (z. B. 0.5 = in mind. 50% aller Doks).
+        top_n_cap: Obergrenze der Kandidaten (nur die häufigsten).
+        whitelist: Wörter, die *nicht* zu Stopwörtern werden sollen (z. B. Domänennamen).
+    """
     whitelist = whitelist or set()
     n_docs = len(tokens_list)
     if n_docs == 0:
         return set()
+
     doc_freq = Counter()
     for ts in tokens_list:
         doc_freq.update(set(ts))
+
     thresh = max(1, int(math.ceil(df_ratio * n_docs)))
     cand = [t for t, dfc in doc_freq.items() if dfc >= thresh]
     cand.sort(key=lambda t: (-doc_freq[t], t))
     cand = cand[:top_n_cap]
+
     auto_sw = set()
     for t in cand:
-        if t in whitelist:     continue
-        if len(t) < 3:         continue
-        if any(ch.isdigit() for ch in t): continue
+        if t in whitelist:                # Domänenwörter nicht muten
+            continue
+        if len(t) < 3:                     # sehr kurze Tokens ignorieren
+            continue
+        if any(ch.isdigit() for ch in t):  # Zahlentokens ignorieren
+            continue
         auto_sw.add(t)
     return auto_sw
 
-def _choose_df_params(n_docs: int,
-                      base_min_df_abs: int, base_min_df_frac: float,
-                      base_max_df_frac: float) -> Tuple[int, float]:
-    n_docs = max(int(n_docs), 1)
-    min_df_val = max(1, max(base_min_df_abs, int(math.ceil(base_min_df_frac * n_docs))))
-    min_df_val = min(min_df_val, max(1, n_docs - 1))
-    max_df_val = min(1.0, max(base_max_df_frac, 2.0 / n_docs))
-    max_docs_allowed = int((max_df_val * n_docs) // 1)
-    if max_docs_allowed <= 1:
-        max_df_val = 1.0
-        max_docs_allowed = n_docs
-    if min_df_val > max_docs_allowed - 1:
-        max_df_val = 1.0
-        max_docs_allowed = n_docs
-        if min_df_val > max_docs_allowed - 1:
-            min_df_val = max(1, n_docs - 1)
-    return int(min_df_val), float(max_df_val)
 
-# -------------------------
-# Helper: robuste Vektorisierung
-# -------------------------
 def _safe_vectorize(texts, min_df, max_df, stop_words_norm, max_features):
-    """Robuster Count-Vect mit Fehlerabfang."""
+    """
+    Wrapper um vectorize_counts mit defensiver Fehlerbehandlung
+    (z. B. wenn max_df < min_df resultiert).
+
+    Returns:
+        (vectorizer, X) oder (None, None) bei Fehlschlag.
+    """
     try:
         vec, X = vectorize_counts(
             texts,
@@ -251,6 +350,7 @@ def _safe_vectorize(texts, min_df, max_df, stop_words_norm, max_features):
         return vec, X
     except ValueError as e:
         msg = str(e)
+        # Häufiger Sonderfall: max_df < min_df -> auf max_df=1.0 hochsetzen
         if "max_df corresponds to < documents than min_df" in msg:
             adj_max_df = 1.0
             print(f"[Warn] Adjusting max_df to {adj_max_df:.2f} (min_df={min_df}) due to: {e}")
@@ -262,6 +362,7 @@ def _safe_vectorize(texts, min_df, max_df, stop_words_norm, max_features):
                 return vec, X
             except Exception:
                 return None, None
+        # Nach dem Pruning keine Terme -> zurückfallen lassen
         if "After pruning, no terms remain" in msg:
             return None, None
         return None, None
@@ -273,24 +374,29 @@ def _vectorize_to_window(
     pairs: Optional[List[Tuple[int, float]]] = None
 ):
     """
-    Probiert mehrere (min_df, max_df)-Paare und nimmt den ersten 'gut genug' Treffer,
-    sonst den Versuch mit den meisten Features.
+    Probiert mehrere (min_df, max_df)-Paare (Fenster) durch und wählt:
+      - den ersten Versuch, der >= feat_min_hard Features liefert
+      - sonst den Versuch mit den meisten Features (best effort)
+
+    Args:
+        texts: Liste der vektorisierten Dokumenttexte.
+        stop_words_norm: normalisierte Stopwörter.
+        feat_min_hard: harte Untergrenze an Features für LDA.
+        max_features_cap: Vectorizer-Deckel (zur Laufzeitkontrolle).
+        pairs: falls None -> default_pairs (robuste Standardfenster).
     """
     n_docs = len(texts)
 
-    # Default-Fenster (für Diskussion/Frage-DE etc.)
+    # Standardfenster für typische, mittelgroße Korpora
     default_pairs = [(15, 1.00), (10, 0.30), (5, 0.40), (2, 0.60)]
-    # Quick-Win: für News/Events liefert dieses Set meist schneller brauchbare Features
-    news_events_pairs = [(5, 0.60), (10, 0.30), (15, 1.00), (2, 0.60)]
-
-    # Wenn der Aufrufer kein Set übergibt, nehmen wir default
     pairs = pairs or default_pairs
 
     best_by_feats = None
     best_feats = -1
 
     for (min_df, max_df) in pairs:
-        min_df_eff = min(min_df, max(1, int(0.15 * n_docs)))  # min_df an n_docs koppeln
+        # min_df an n_docs koppeln (verhindert zu hohe absolute min_df bei kleinen n)
+        min_df_eff = min(min_df, max(1, int(0.15 * n_docs)))
         vec, X = _safe_vectorize(texts, min_df_eff, max_df, stop_words_norm, max_features=max_features_cap)
         n_features = int(X.shape[1]) if X is not None else 0
         print(f"[Info] Try vectorize: n_docs={n_docs}, min_df={min_df_eff}, max_df={max_df:.2f} -> features={n_features}")
@@ -309,57 +415,53 @@ def _vectorize_to_window(
 
     return None, None, None
 
+
 def _lang_guess_series(df: pd.DataFrame) -> pd.Series:
-    """Schätzt Sprache aus Titel + Rohtext (ohne Stopwort-Removal)."""
-    # 1) Titel
+    """
+    Heuristischer Sprach-Guess pro Dokument ("de"/"en"/"unk") basierend
+    auf Titel + Rohtext (ohne Stopwort-Removal).
+    """
     parts = []
     if "title" in df.columns:
         parts.append(df["title"].fillna(""))
 
-    # 2) Body/Selftext – nimm die erste existierende Spalte
     for c in ("selftext", "body", "text", "content"):
         if c in df.columns:
             parts.append(df[c].fillna(""))
             break
 
-    # 3) Fallback: wenn nichts gefunden, nimm clean_for_vect (besser als nichts)
     if not parts:
         if "clean_for_vect" in df.columns:
             parts.append(df["clean_for_vect"].fillna(""))
         else:
             return pd.Series(["unk"] * len(df), index=df.index)
 
+    # Titel + erster Textkörper zusammenkleben
     s = parts[0]
     for p in parts[1:]:
         s = s.str.cat(p, sep=" ", na_rep="")
 
-    # Jetzt erst clean + tokenize (ohne Stopwort-Entfernung!)
+    # Dann clean/tokenize und auf Stopwort-Treffer prüfen
     lang_tokens = s.map(clean_text).map(tokenize)
     return lang_tokens.map(_infer_lang_from_tokens)
 
-# -------------------------
-# Topic-Labeling (ohne Extra-Libs)
-# -------------------------
 
-# -------------------------
-# Labeling-Konfiguration
-# -------------------------
+# Stopwort-/Label-Hilfssets ----------------------------------------------------
 
-# Füllwörter, die für Labels unbrauchbar sind (nur fürs Labeling!):
+# Wörter, die zwar häufig sind, aber als Topic-Labels kaum Mehrwert liefern:
 LABEL_FILLER = {
     # DE
     "mal","mehr","schon","einfach","leider","echt","besser","immer","klar","gut","gibt",
     "find","findet","frage","wohl","gerade","vielleicht","irgendwie","ziemlich","bisschen",
     "eher","sogar","glaube","finde","tatsächlich","natürlich","halt","eigentlich","wirklich",
     "besten","deutschen","absolut","alte","alten","neue","neuen","groß","klein",
-    "teuer","nie","rum","ganzen","davon","drauf","bzw","wohl", "nie","rum","davon",
-    "drauf","bzw","wohl",
+    "teuer","nie","rum","ganzen","davon","drauf","bzw",
     # EN
     "like","get","know","make","one","people","really","thing","things","would","could",
     "also","still","maybe","just","even","well","good","bad","new","old","time"
 }
 
-# Domänen-Whitelist (triggert Bonus-Punkte in Labels)
+# Domänenterms (Stuttgart/ÖPNV/Politik etc.), die wir als Label eher *bevorzugen*:
 DOMAIN_WHITELIST = {
     "stuttgart","stuttgarter","0711","kessel","neckar",
     "hbf","hauptbahnhof","olgaeck","vaihingen","bad","cannstatt","bad_cannstatt","cannstatter",
@@ -370,7 +472,7 @@ DOMAIN_WHITELIST = {
     "heslach","deggerloch","berg","ostfildern","leonberg"
 }
 
-# Schöne Schreibweisen (Anzeigeform)
+# Anzeigeform schöner schreiben (z. B. "hbf" -> "Hbf", "bad_cannstatt" -> "Bad Cannstatt")
 DISPLAY_CASE = {
     "stuttgart":"Stuttgart","stuttgarter":"Stuttgarter","neckar":"Neckar",
     "hbf":"Hbf","hauptbahnhof":"Hauptbahnhof","olgaeck":"Olgaeck",
@@ -380,7 +482,100 @@ DISPLAY_CASE = {
     "polizei":"Polizei","demo":"Demo","wahl":"Wahl","bundestagswahl":"Bundestagswahl","afd":"AfD","cdu":"CDU","spd":"SPD","grüne":"Grüne","fdp":"FDP"
 }
 
+
+# ============================================================================
+# Label-Kandidaten & -Deduplikation
+# ============================================================================
+
+def _label_candidate_list(primary_label: str, topic_terms) -> list[str]:
+    """
+    Erzeugt alternative Label-Kandidaten (Varianten) für *ein* Topic:
+
+    - Primärlabel (falls vorhanden)
+    - Bigramme aus Top-Unigrammen in verschiedenen Anordnungen
+    - Einwort-Fallbacks
+
+    Args:
+        primary_label: bereits gewähltes Label (z. B. durch _build_topic_labels)
+        topic_terms: Liste [(term, weight), ...] der Top-Terme für dieses Topic
+
+    Returns:
+        Liste eindeutiger Kandidatenstrings (erste ist beste).
+    """
+    terms = [w for (w, _) in (topic_terms or [])][:4]
+
+    def T(s: str) -> str:
+        return (s or "").strip().replace("_", " ").title()
+
+    cands: list[str] = []
+    seen = set()
+
+    def add(lbl: str):
+        key = lbl.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            cands.append(lbl)
+
+    # 1) Primärlabel
+    if primary_label:
+        add(primary_label)
+
+    # 2) Bigramme aus Top-Unigrammen
+    if len(terms) >= 2:
+        a, b = T(terms[0]), T(terms[1])
+        add(f"{a} - {b}")
+        add(f"{b} - {a}")
+
+    # 3) Weitere Kombinationen
+    if len(terms) >= 3:
+        add(f"{T(terms[0])} - {T(terms[2])}")
+    if len(terms) >= 4:
+        add(f"{T(terms[1])} - {T(terms[3])}")
+
+    # 4) Unigram-Fallbacks
+    for t in terms[:3]:
+        add(T(t))
+
+    return cands
+
+
+def _dedup_topic_labels(primary_labels: list[str], topic_terms_list: list[list[tuple[str, float]]]) -> list[str]:
+    """
+    Dedupliziert Labels über *mehrere* Topics hinweg. Wenn ein Label schon
+    vergeben ist, wird für das Topic die nächste Kandidatenvariante gewählt.
+
+    Args:
+        primary_labels: Labels in Topic-Reihenfolge (primär vorgeschlagen).
+        topic_terms_list: Top-Terme je Topic (gleiches Indexing wie primary_labels).
+
+    Returns:
+        Liste derselben Länge mit eindeutigen (deduplizierten) Labels.
+    """
+    used = set()
+    out: list[str] = []
+
+    for i, prim in enumerate(primary_labels):
+        cands = _label_candidate_list(prim, topic_terms_list[i])
+        chosen = None
+        for c in cands:
+            key = c.strip().lower()
+            if key and key not in used:
+                chosen = c
+                break
+        if not chosen:
+            # Harter Fallback, praktisch selten nötig
+            chosen = f"Topic {i+1}"
+        used.add(chosen.strip().lower())
+        out.append(chosen)
+    return out
+
+
+# ============================================================================
+# Topic-Labeling (mit Domänen-Bonus)
+# ============================================================================
+
 def _split_ngram(term: str):
+    """Hilfsfunktion: 'a_b'/'a b' -> ['a', 'b']; Sonst ['a']."""
     term = term.strip()
     if " " in term:
         return term.split()
@@ -388,7 +583,9 @@ def _split_ngram(term: str):
         return term.split("_")
     return [term]
 
+
 def _is_valid_token(tok: str, stop_words, min_len: int = 3) -> bool:
+    """Token ist brauchbar, wenn lang genug, keine Ziffern, nicht Stopwort/Füllwort."""
     if not tok or len(tok) < min_len:
         return False
     if tok.isdigit():
@@ -397,42 +594,51 @@ def _is_valid_token(tok: str, stop_words, min_len: int = 3) -> bool:
         return False
     return True
 
+
 def _pretty_token(tok: str) -> str:
+    """Anzeigeform (Unterstriche weg, Domain-Casing anwenden, sonst Title-Case)."""
     t = tok.replace("_", " ")
-    return DISPLAY_CASE.get(tok, DISPLAY_CASE.get(t, t))
+    return DISPLAY_CASE.get(tok, DISPLAY_CASE.get(t, t.title()))
+
 
 def _score_bigram_for_topic(bigram: str, t_id: int, vocab_index: dict, comps, stop_words) -> float:
+    """
+    Scoring für Bigramme pro Topic:
+    - Basis: Gewicht des Bigramms + 0.5*(Gewicht Wort1 + Gewicht Wort2)
+    - Domänenbonus für Stuttgart-Wörter
+    - leichte Strafe für Füllwörter
+    """
     toks = _split_ngram(bigram)
     if len(toks) != 2:
         return -1e9
     if not all(_is_valid_token(t, stop_words) for t in toks):
         return -1e9
 
-    # Basis-Score aus Topic-Gewichten
     w_bigram = comps[t_id, vocab_index.get(bigram, -1)] if bigram in vocab_index else 0.0
     w_t1 = comps[t_id, vocab_index.get(toks[0], -1)] if toks[0] in vocab_index else 0.0
     w_t2 = comps[t_id, vocab_index.get(toks[1], -1)] if toks[1] in vocab_index else 0.0
     score = w_bigram + 0.5 * (w_t1 + w_t2)
 
-    # Domänen-Bonus
     if toks[0] in DOMAIN_WHITELIST: score += 2.0
     if toks[1] in DOMAIN_WHITELIST: score += 2.0
-
-    # leichte Strafe für „weiche“ Wörter
-    if toks[0] in LABEL_FILLER: score -= 1.0
-    if toks[1] in LABEL_FILLER: score -= 1.0
+    if toks[0] in LABEL_FILLER:     score -= 1.0
+    if toks[1] in LABEL_FILLER:     score -= 1.0
     return score
+
 
 def _build_topic_labels(lda_model, feat_names, stop_words, topn: int = 40, join_char: str = " - "):
     """
-    Wählt pro Topic das beste Bigram (mit Domänen-Bonus), sonst zwei Unigramme.
-    Gibt eine Liste von display-fertigen Strings zurück (z. B. 'Hbf - Unfall').
+    Konstruiert pro Topic ein **lesbares Label**:
+    - Bevorzugt das bestbewertete Bigramm (mit Domänen-Bonus),
+    - sonst nimmt es zwei valide Unigramme (Domänen-Terme bevorzugt),
+    - als letzter Fallback das *erste* Top-Term.
+
+    Returns:
+        Liste von Strings (ein Label pro Topic, Reihenfolge = Topic-ID).
     """
     comps = lda_model.components_
     n_topics = comps.shape[0]
     labels = [""] * n_topics
-
-    # Index für schnelles Lookup
     vocab_index = {feat: idx for idx, feat in enumerate(feat_names)}
 
     for t_id in range(n_topics):
@@ -440,10 +646,8 @@ def _build_topic_labels(lda_model, feat_names, stop_words, topn: int = 40, join_
         top_idx = order[:topn]
         top_terms = [feat_names[j] for j in top_idx]
 
-        # Kandidaten-Bigramme (nur echte 2-Tokens)
+        # Kandidaten-Bigramme scoren
         cand_bi = [w for w in top_terms if len(_split_ngram(w)) == 2]
-
-        # Scoring
         scored = [(w, _score_bigram_for_topic(w, t_id, vocab_index, comps, stop_words)) for w in cand_bi]
         scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -452,16 +656,12 @@ def _build_topic_labels(lda_model, feat_names, stop_words, topn: int = 40, join_
             t1, t2 = _split_ngram(scored[0][0])
             label = _pretty_token(t1) + join_char + _pretty_token(t2)
         else:
-            # Fallback: zwei beste Unigramme (mit Domänen-Priorität)
-            unis = [
-                w for w in top_terms
-                if len(_split_ngram(w)) == 1 and _is_valid_token(w, stop_words)
-            ]
+            # Unigram-Variante
+            unis = [w for w in top_terms if len(_split_ngram(w)) == 1 and _is_valid_token(w, stop_words)]
             if not unis:
                 labels[t_id] = top_terms[0] if top_terms else f"Topic {t_id}"
                 continue
-
-            # Domänen-Tokens nach vorne ziehen
+            # Domänenwörter nach vorn
             unis.sort(key=lambda w: (w not in DOMAIN_WHITELIST, ), reverse=False)
             if len(unis) >= 2:
                 label = _pretty_token(unis[0]) + join_char + _pretty_token(unis[1])
@@ -472,7 +672,19 @@ def _build_topic_labels(lda_model, feat_names, stop_words, topn: int = 40, join_
     return labels
 
 
+# ============================================================================
+# Pro-Flair-Block: End-to-End-Lauf (Preprocess -> Vectorize -> LDA -> Output)
+# ============================================================================
+
 def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: set) -> None:
+    """
+    Führt den gesamten Prozess für *einen* Flair-Block aus:
+    Subsetting, Preprocess, Stopwort-Heuristik, Vektorisierung, LDA,
+    Label-Erzeugung + Deduplikation, Beispielpost-Export, Konsolen-Output.
+
+    Achtung:
+      - Konsolenprints werden vom HTML-Parser weiter unten geparst (Format beibehalten!).
+    """
     name = run_cfg["name"]
     fe = run_cfg.get("filter_english", True)
     flairs = run_cfg["flairs"]
@@ -487,7 +699,7 @@ def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: s
 
     print(f"\n# ==== Themen für Flair: {name} ====")
 
-    # Subset
+    # --- Subset auf gewünschten Flair
     if "flair_text" in df_raw.columns:
         sub_raw = df_raw[df_raw["flair_text"].isin(flairs)].reset_index(drop=True)
     else:
@@ -496,17 +708,20 @@ def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: s
         print(f"[Skip] Keine Dokumente für {name}.")
         return
 
-    # Vorverarbeitung
+    # --- Preprocess (inkl. optionaler Kommentare)
     df = add_clean_columns(sub_raw, use_stemming=False, filter_english=fe, include_comments=include_comments)
+
+    # Dok-länge filtern
     if "tokens" in df.columns:
         df = df[df["tokens"].map(len) >= min_tokens].reset_index(drop=True)
     if df.empty:
         print(f"[Skip] Nach Preprocess/Tokenfilter keine Dokumente für {name}.")
         return
 
-    # Sprachfilter (nach Preprocess, aber auf Basis von Titel/Rohtext heuristisch geschätzt)
+    # --- Sprachfilter (nur wenn explizit DE/EN gefordert)
     if lang_target in ("de", "en"):
         if lang_target == "de" and fe is True:
+            # DE wird implizit durch filter_english=True beibehalten
             print("[Info] Language filter 'de': skipped (filter_english=True hat EN bereits entfernt).")
         else:
             df["lang_guess"] = _lang_guess_series(df)
@@ -517,7 +732,7 @@ def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: s
                 print(f"[Skip] Zu wenig klare {lang_target.upper()}-Dokumente – LDA übersprungen.")
                 return
 
-    # Auto-Stopwörter
+    # --- Auto-Stopwörter + manuelle Ergänzungen
     auto_sw = _auto_stopwords_from_tokens(
         df["tokens"].tolist(),
         df_ratio=df_ratio_auto_sw,
@@ -530,20 +745,21 @@ def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: s
         show = sorted(list(auto_sw))[:12]
         print(f"[Info] Auto-Stopwörter ({len(auto_sw)}): {show}{' ...' if len(auto_sw)>12 else ''}")
 
+    # Gesamtes Stopwort-Set (DE/EN/Technik + Auto)
     stop_union = (GERMAN_SW | ENGLISH_SW | TECHNICAL_SW | auto_sw)
     stop_union_norm = _normalize_stopwords(stop_union)
 
-    # Texte + Titel-Boost
+    # --- Texte mit Titel-Boost bauen (Vektorisierungsbasis)
     texts = _build_texts_with_title_boost(df, title_boost)
 
-    # Param-Fenster
+    # --- Param-Fenster für Vectorizer (News/Events etwas anders)
     is_en = (run_cfg.get("lang") == "en")
     is_news_or_events = any(nm in run_cfg["name"].lower() for nm in ["news", "events"])
     pairs = run_cfg.get("pairs")
     if pairs is None and is_news_or_events:
         pairs = [(5, 0.60), (10, 0.30), (15, 1.00), (2, 0.60)]
 
-    # Vektorisierung
+    # --- Vektorisierung (robust)
     vec_counts, Xc, used_params = _vectorize_to_window(
         texts,
         stop_words_norm=stop_union_norm,
@@ -555,10 +771,9 @@ def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: s
         print(f"[Abbruch] Zu wenig Features in {name}.")
         return
 
-    # Fallback bei sehr kleinen Korpora
-    min_feats_for_lda = run_cfg.get("feat_min_hard", 80)          # z. B. News-DE: 40
-    min_docs_for_lda  = run_cfg.get("docs_min", 8)                # Standard bleibt 8
-
+    # --- Fallback auf TF-IDF bei zu kleinem Korpus
+    min_feats_for_lda = run_cfg.get("feat_min_hard", 80)
+    min_docs_for_lda  = run_cfg.get("docs_min", 8)
     if Xc.shape[0] < min_docs_for_lda or Xc.shape[1] < min_feats_for_lda:
         print(
             f"[Info] {name}: kleiner Korpus – Fallback auf TF-IDF-Keywords "
@@ -568,55 +783,63 @@ def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: s
         _fallback_keywords(texts, stop_union_norm, top_n=12)
         return
 
-    # Kandidaten-K einschränken
+    # --- K-Kandidaten begrenzen (nach Datenlage)
     candidates_k = cand_k if cand_k is not None else DEFAULT_CANDIDATE_K
-    if is_en:
-        candidates_k = [k for k in candidates_k if k in (2,3)]
-    max_topics_allowed = max(2, min(12, Xc.shape[0]-1, Xc.shape[1]-1))
+    if is_en:  # kleine EN-Korpora: realistisch nur 2/3 Topics
+        candidates_k = [k for k in candidates_k if k in (2, 3)]
+    max_topics_allowed = max(2, min(12, Xc.shape[0] - 1, Xc.shape[1] - 1))
     candidates_k = [k for k in candidates_k if 2 <= k <= max_topics_allowed] or [2]
 
-    # LDA + Kohärenz
-    best = {"coh": -1e9, "k": None, "model": None, "doc_topic": None, "seed": None}
-    for k in candidates_k:
-        for seed in SEEDS:
-            lda_k, dt_k = lda_from_matrix(Xc, n_topics=k, max_iter=60, random_state=seed)
-            coh_k = umass_coherence(lda_k, Xc, topn=12)
-            if coh_k > best["coh"]:
-                best.update({"coh": coh_k, "k": k, "model": lda_k, "doc_topic": dt_k, "seed": seed})
-
-    if best["model"] is None:
+    # --- LDA: bestes Modell via Kohärenz (zentralisiert)
+    lda, doc_topic, best_k, best_seed, best_coh = fit_best_lda(
+        Xc, candidates_k, SEEDS, max_iter=60, topn=12
+    )
+    if lda is None:
         print(f"[Abbruch] Kein LDA-Modell für {name}.")
         return
 
-    lda = best["model"]
-    doc_topic = best["doc_topic"]
+    # --- Top-Terme und Labels bilden
     feat_names = vec_counts.get_feature_names_out()
-    topics_all = top_terms_per_topic(lda, feat_names, topn=12)  # <- konsistente Variable
+    topics_all = top_terms_per_topic(lda, feat_names, topn=12)
     labels = _build_topic_labels(lda, feat_names, stop_union_norm, topn=40)
 
-    print(f"[Info] {name}: K={best['k']} Seed={best['seed']} Coh={best['coh']:.3f} "
-          f"(features={Xc.shape[1]}, min_df={used_params['min_df']}, "
-          f"max_df={used_params['max_df']:.2f}, title_boost={title_boost}, comments={include_comments})")
+    # Konsistente Statuszeile (vom HTML-Report geparst)
+    print(
+        f"[Info] {name}: K={best_k} Seed={best_seed} Coh={best_coh:.3f} "
+        f"(features={Xc.shape[1]}, min_df={used_params['min_df']}, "
+        f"max_df={used_params['max_df']:.2f}, title_boost={title_boost}, comments={include_comments})"
+    )
 
-    # Ausgabe
+    # --- Auswahl der anzuzeigenden Topics (Top-K nach Gesamtzuweisung)
     k_report = min(5, doc_topic.shape[1])
     top_idx, _ = pick_top_k_topics(doc_topic, k=k_report)
 
+    # Label-Dedup: pro angezeigtem Topic alternative Labels generieren und Dubs vermeiden
+    ordered_terms = [topics_all[t] for t in top_idx]
+    primary_labels = [labels[t] for t in top_idx]
+    ordered_labels = _dedup_topic_labels(primary_labels, ordered_terms)
+    label_by_topic = {t: ordered_labels[i] for i, t in enumerate(top_idx)}
+
+    # --- Output (Konsole + Beispiele in CSV)
     rows = []
     topic_assign = doc_topic.argmax(axis=1)
+
     for rank, t_id in enumerate(top_idx, start=1):
         terms_str = ", ".join([w for w, _ in topics_all[t_id]])
-        label = labels[t_id] if t_id < len(labels) else ""
+        label = label_by_topic.get(t_id, labels[t_id])
+
+        # WICHTIG: Diese Zeile wird vom Parser erwartet:
         if label:
             print(f"Topic {rank} (ID {t_id}) [{label}]: {terms_str}")
         else:
             print(f"Topic {rank} (ID {t_id}): {terms_str}")
 
-        # Beispiel-Posts
+        # 3 Beispielposts pro Topic exportieren (falls vorhanden)
         mask = (topic_assign == t_id)
         scores = doc_topic[mask, t_id]
         if getattr(scores, "size", 0) == 0:
             continue
+
         which = scores.argsort()[::-1][:3]
         candidates = df.loc[mask].iloc[which]
         for idx_row in candidates.index:
@@ -634,8 +857,18 @@ def _run_for_flair_block(df_raw: pd.DataFrame, run_cfg: Dict, base_stop_union: s
             DATA_DIR / f"samples_{name.lower().replace('/','_')}_per_topic.csv", index=False
         )
 
+
+# ============================================================================
+# main(): Laden, Statistik, Blockläufe
+# ============================================================================
+
 def main():
-# 1) Daten abrufen (oder vorhandene RAW verwenden)
+    """
+    Hauptfunktion:
+      - lädt/holt Rohdaten
+      - schreibt Top-Flairs und Top-User (CSV + Konsole)
+      - iteriert über FLAIR_RUNS und führt _run_for_flair_block aus
+    """
     raw_path = DATA_DIR / "raw_r_stuttgart.csv"
     if raw_path.exists():
         print("[Info] Lade RAW aus CSV …")
@@ -652,8 +885,7 @@ def main():
         )
         df_raw.to_csv(raw_path, index=False)
 
-
-    # 1) Flairs & aktivste User (auf kompletter RAW-Basis)
+    # Übersichtstabellen
     flairs = extract_flairs(df_raw).head(20)
     active_users = (df_raw["author"]
                     .dropna()
@@ -665,20 +897,26 @@ def main():
 
     print("\n=== Top 20 Flairs ===")
     print(flairs.to_string() if not flairs.empty else "(keine Flairs gefunden)")
+
     print("\n=== Top 20 aktivste User ===")
     print(active_users.to_string() if not active_users.empty else "(keine Nutzer ermittelt)")
 
-    # 2) Pro Flair eigene Themenmodelle
+    # Pro-Flair die Themenmodelle bauen
     base_stop_union = GERMAN_SW | ENGLISH_SW
     for run in FLAIR_RUNS:
         _run_for_flair_block(df_raw, run, base_stop_union)
 
-# === Enhanced HTML Report (drop-in) ===
+
+# ============================================================================
+# HTML-Report – Parser & Renderer (aus Konsolen-Output)
+# ============================================================================
+
 from pathlib import Path
 import re as _re
 import html as _html
 import pandas as _pd
 
+# Regexe für den Parser (kontraktgebunden an die Print-Ausgaben oben!)
 _SEC_HDR = _re.compile(r"^# ==== (.+?) ====\s*$")
 _RE_TRYV = _re.compile(r"^\[Info\]\s*Try vectorize:\s*n_docs=(\d+).*?->\s*features=(\d+)", _re.I)
 _RE_TRYV_SIMPLE = _re.compile(r"^\[Info\]\s*Try vectorize:\s*n_docs=(\d+)", _re.I)
@@ -686,8 +924,12 @@ _RE_LANG_EN = _re.compile(r"^\[Info\]\s*Language filter 'en': kept (\d+)\/(\d+) 
 _RE_KLINE = _re.compile(r"K\s*=\s*(\d+).*?Coh\s*=\s*([-\d\.]+).*?features\s*=\s*(\d+)", _re.I)
 _RE_TOPIC = _re.compile(r"^Topic\s+(\d+)\s+\(ID\s+(\d+)\)\s*(\[[^\]]+\])?:\s*(.+)$")
 
+
 def _split_sections(captured_text: str):
-    """Teilt den Konsolenoutput in benannte Abschnitte (dict title -> list[str])."""
+    """
+    Zerlegt den Roh-Log in Abschnitte (Titel -> Zeilen),
+    anhand der "# ===="-Header.
+    """
     sections = {}
     current = None
     for ln in captured_text.splitlines():
@@ -699,8 +941,14 @@ def _split_sections(captured_text: str):
             sections[current].append(ln)
     return sections
 
+
 def _parse_block(lines):
-    """Extrahiert Topics + Kennzahlen (K/Coh/Features/Docs)."""
+    """
+    Extrahiert aus den Zeilen eines Abschnitts:
+      - Topicliste (rank, id, label, terms)
+      - Kennzahlen (K, Kohärenz, Features)
+      - Doks/EN-Kept (falls vorhanden)
+    """
     topics = []
     k_info = {"K": None, "Coh": None, "features": None}
     docs = None
@@ -738,13 +986,16 @@ def _parse_block(lines):
                 "terms": terms
             })
 
-    # Fallback features aus Try-Vectorize, falls K-Zeile fehlte
+    # Fallback: Features aus Try-Vectorize, falls K-Zeile fehlte
     if k_info["features"] is None and feats_from_try is not None:
         k_info["features"] = str(feats_from_try)
     return topics, k_info, docs, kept_en
 
+
 def _tbl_topics(topics, k_info, docs, kept_en):
-    """Baut HTML-Tabelle der Topics + kleine Kopfzeile mit Stats."""
+    """
+    Baut eine HTML-Tabelle für Topics + schlanke Kopfleiste mit Stats.
+    """
     if not topics:
         return "<div class='muted'>Keine Topics vorhanden.</div>"
 
@@ -773,8 +1024,11 @@ def _tbl_topics(topics, k_info, docs, kept_en):
     rows.append("</tbody></table>")
     return (f"<div class='muted'>{head}</div>" if head else "") + "\n" + "\n".join(rows)
 
+
 def _pair_card(title_left, block_left, title_right, block_right):
-    """Zwei Spalten nebeneinander."""
+    """
+    Stellt zwei Topics-Tabellen nebeneinander (DE/EN-Pair) dar.
+    """
     left_html = _tbl_topics(*block_left)
     right_html = _tbl_topics(*block_right)
     return f"""
@@ -784,38 +1038,39 @@ def _pair_card(title_left, block_left, title_right, block_right):
     </div>
     """
 
+
 def _build_topic_grids(sections):
-    """Erzeugt je Flair ein DE/EN-Paar."""
+    """
+    Baut die vier DE/EN-Paare (Diskussion, News, Events, Frage/Advice).
+    """
     def blk(name):
         lines = sections.get(name, [])
         return _parse_block(lines)
 
     grids = []
-
-    # Diskussion
     grids.append(_pair_card(
         "Diskussion – DE", blk("Themen für Flair: Diskussion - DE"),
         "Diskussion – EN", blk("Themen für Flair: Diskussion - EN"),
     ))
-    # News
     grids.append(_pair_card(
         "News – DE", blk("Themen für Flair: News - DE"),
         "News – EN", blk("Themen für Flair: News - EN"),
     ))
-    # Events
     grids.append(_pair_card(
         "Events – DE", blk("Themen für Flair: Events - DE"),
         "Events – EN", blk("Themen für Flair: Events - EN"),
     ))
-    # Frage/Advice
     grids.append(_pair_card(
         "Frage/Advice – DE", blk("Themen für Flair: Frage/Advice - DE"),
         "Frage/Advice – EN", blk("Themen für Flair: Frage/Advice - EN"),
     ))
     return "\n".join(grids)
 
+
 def _stats_card(sections):
-    """Kleine Statistik über Doks/Features je Block."""
+    """
+    Kleine Übersichts-Tabelle (pro Block: Doks, EN kept, K, Coh, Features).
+    """
     rows = []
     rows.append("<table class='tbl'><thead><tr><th>Block</th><th>Dok.</th><th>EN kept</th><th>K</th><th>Coh</th><th>Features</th></tr></thead><tbody>")
     wanted = [
@@ -842,7 +1097,11 @@ def _stats_card(sections):
     rows.append("</tbody></table>")
     return "<div class='card'><h2>Statistik</h2>" + "\n".join(rows) + "</div>"
 
+
 def _try_read_table_csv(path: Path, title: str):
+    """
+    Liest eine CSV (falls vorhanden) und rendert sie als HTML-Tabelle im Report.
+    """
     try:
         if path.exists():
             df = _pd.read_csv(path)
@@ -851,12 +1110,19 @@ def _try_read_table_csv(path: Path, title: str):
         pass
     return f"<div class='card'><h2>{_html.escape(title)}</h2><div class='muted'>keine Tabelle gefunden</div></div>"
 
+
 def _write_html_report_from_text(captured_text: str, outpath: Path):
-    """Schreibt einen hübschen HTML-Report:
-       - Top Flairs & Top User als Tabellen
-       - pro Flair (Diskussion/News/Events/Frage) je DE/EN nebeneinander als Topics-Tabellen
-       - Statistik-Card
-       - ganz unten: kompletter Konsolen-Output (Roh-Log)
+    """
+    Schreibt den finalen HTML-Report basierend auf dem *Konsolen-Output*.
+
+    Aufbau:
+      - Top Flairs & Top User (CSV -> Tabellen)
+      - Statistik-Card (pro Block)
+      - Topics-Grids (DE/EN nebeneinander für alle Flairs)
+      - Ganz unten: Roh-Log (als <pre>)
+
+    Hinweis:
+      - Das Styling ist bewusst schlank/generisch gehalten.
     """
     sections = _split_sections(captured_text)
 
@@ -866,7 +1132,7 @@ def _write_html_report_from_text(captured_text: str, outpath: Path):
     topic_grids = _build_topic_grids(sections)
     stats_html  = _stats_card(sections)
 
-    # kompletter Roh-Log (wie bisher)
+    # kompletter Roh-Log wie auf der Konsole
     raw_log = _html.escape(captured_text)
 
     html_doc = f"""<!doctype html>
@@ -925,15 +1191,23 @@ def _write_html_report_from_text(captured_text: str, outpath: Path):
     print(f"[Info] HTML-Report gespeichert: {outpath}")
 
 
+# ============================================================================
+# Script-Entry (mit stdout-Capture für den Report)
+# ============================================================================
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
 
     import io, contextlib
     buf = io.StringIO()
+
+    # Konsole "normal" befüllen, aber parallel den Text für den Report sammeln.
     with contextlib.redirect_stdout(buf):
         main()
+
     captured = buf.getvalue()
     print(captured, end="")  # Konsole wie bisher
+
     REPORT_PATH = (DATA_DIR / "report.html")
     _write_html_report_from_text(captured, REPORT_PATH)
