@@ -80,8 +80,6 @@ cd dlbdseda02_d
 python -m venv .venv
 # macOS/Linux:
 source .venv/bin/activate
-# Windows (Powershell):
-# .venv\Scripts\Activate.ps1
 
 # 3) Dependencies installieren
 pip install -r requirements.txt
