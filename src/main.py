@@ -309,17 +309,6 @@ def _vectorize_to_window(
 
     return None, None, None
 
-def _autolabel_topic(feature_terms: List[str]) -> str:
-    domain_hits = ["bahn","vvs","haltestelle","linie","ticket","parkhaus","bahnhof",
-                   "stuttgart_21","s21","schlossplatz","fernsehturm","innenstadt","demo","afd","wahl","brandmauer","polizei","öpnv"]
-    for t in feature_terms:
-        if " " in t:
-            return t
-    for t in feature_terms:
-        if t in domain_hits:
-            return t
-    return " / ".join(feature_terms[:2])
-
 def _lang_guess_series(df: pd.DataFrame) -> pd.Series:
     """Schätzt Sprache aus Titel + Rohtext (ohne Stopwort-Removal)."""
     # 1) Titel
@@ -684,7 +673,267 @@ def main():
     for run in FLAIR_RUNS:
         _run_for_flair_block(df_raw, run, base_stop_union)
 
+# === Enhanced HTML Report (drop-in) ===
+from pathlib import Path
+import re as _re
+import html as _html
+import pandas as _pd
+
+_SEC_HDR = _re.compile(r"^# ==== (.+?) ====\s*$")
+_RE_TRYV = _re.compile(r"^\[Info\]\s*Try vectorize:\s*n_docs=(\d+).*?->\s*features=(\d+)", _re.I)
+_RE_TRYV_SIMPLE = _re.compile(r"^\[Info\]\s*Try vectorize:\s*n_docs=(\d+)", _re.I)
+_RE_LANG_EN = _re.compile(r"^\[Info\]\s*Language filter 'en': kept (\d+)\/(\d+) docs\.", _re.I)
+_RE_KLINE = _re.compile(r"K\s*=\s*(\d+).*?Coh\s*=\s*([-\d\.]+).*?features\s*=\s*(\d+)", _re.I)
+_RE_TOPIC = _re.compile(r"^Topic\s+(\d+)\s+\(ID\s+(\d+)\)\s*(\[[^\]]+\])?:\s*(.+)$")
+
+def _split_sections(captured_text: str):
+    """Teilt den Konsolenoutput in benannte Abschnitte (dict title -> list[str])."""
+    sections = {}
+    current = None
+    for ln in captured_text.splitlines():
+        m = _SEC_HDR.match(ln)
+        if m:
+            current = m.group(1).strip()
+            sections[current] = []
+        elif current:
+            sections[current].append(ln)
+    return sections
+
+def _parse_block(lines):
+    """Extrahiert Topics + Kennzahlen (K/Coh/Features/Docs)."""
+    topics = []
+    k_info = {"K": None, "Coh": None, "features": None}
+    docs = None
+    feats_from_try = None
+    kept_en = None
+
+    for ln in lines:
+        m = _RE_TRYV.match(ln)
+        if m:
+            docs = int(m.group(1))
+            feats_from_try = int(m.group(2))
+        else:
+            m2 = _RE_TRYV_SIMPLE.match(ln)
+            if m2 and docs is None:
+                docs = int(m2.group(1))
+
+        m3 = _RE_LANG_EN.match(ln)
+        if m3:
+            kept_en = (int(m3.group(1)), int(m3.group(2)))
+
+        if "K=" in ln and "Coh" in ln:
+            mk = _RE_KLINE.search(ln)
+            if mk:
+                k_info["K"] = mk.group(1)
+                k_info["Coh"] = mk.group(2)
+                k_info["features"] = mk.group(3)
+
+        mt = _RE_TOPIC.match(ln)
+        if mt:
+            rank, tid, label_raw, terms = mt.groups()
+            label = (label_raw or "").strip("[] ").replace(" / ", " – ").replace(" - ", " – ")
+            topics.append({
+                "rank": int(rank), "topic_id": int(tid),
+                "label": label if label else "",
+                "terms": terms
+            })
+
+    # Fallback features aus Try-Vectorize, falls K-Zeile fehlte
+    if k_info["features"] is None and feats_from_try is not None:
+        k_info["features"] = str(feats_from_try)
+    return topics, k_info, docs, kept_en
+
+def _tbl_topics(topics, k_info, docs, kept_en):
+    """Baut HTML-Tabelle der Topics + kleine Kopfzeile mit Stats."""
+    if not topics:
+        return "<div class='muted'>Keine Topics vorhanden.</div>"
+
+    headbits = []
+    if docs is not None:
+        headbits.append(f"{docs} Dok.")
+    if kept_en:
+        headbits.append(f"EN kept {kept_en[0]}/{kept_en[1]}")
+    if k_info.get("K"):
+        headbits.append(f"K={_html.escape(k_info['K'])}")
+    if k_info.get("Coh"):
+        headbits.append(f"Coh={_html.escape(k_info['Coh'])}")
+    if k_info.get("features"):
+        headbits.append(f"Features={_html.escape(k_info['features'])}")
+
+    head = " · ".join(headbits)
+    rows = []
+    rows.append("<table class='tbl'><thead><tr><th>#</th><th>Label</th><th>Top-Terme</th></tr></thead><tbody>")
+    for t in topics:
+        label = _html.escape(t["label"]) if t["label"] else "<span class='muted'>(kein Label)</span>"
+        rows.append(
+            f"<tr><td>{t['rank']}</td>"
+            f"<td>{label}<br><span class='muted'>ID {t['topic_id']}</span></td>"
+            f"<td>{_html.escape(t['terms'])}</td></tr>"
+        )
+    rows.append("</tbody></table>")
+    return (f"<div class='muted'>{head}</div>" if head else "") + "\n" + "\n".join(rows)
+
+def _pair_card(title_left, block_left, title_right, block_right):
+    """Zwei Spalten nebeneinander."""
+    left_html = _tbl_topics(*block_left)
+    right_html = _tbl_topics(*block_right)
+    return f"""
+    <div class="grid2">
+      <div class="card"><h3>{_html.escape(title_left)}</h3>{left_html}</div>
+      <div class="card"><h3>{_html.escape(title_right)}</h3>{right_html}</div>
+    </div>
+    """
+
+def _build_topic_grids(sections):
+    """Erzeugt je Flair ein DE/EN-Paar."""
+    def blk(name):
+        lines = sections.get(name, [])
+        return _parse_block(lines)
+
+    grids = []
+
+    # Diskussion
+    grids.append(_pair_card(
+        "Diskussion – DE", blk("Themen für Flair: Diskussion - DE"),
+        "Diskussion – EN", blk("Themen für Flair: Diskussion - EN"),
+    ))
+    # News
+    grids.append(_pair_card(
+        "News – DE", blk("Themen für Flair: News - DE"),
+        "News – EN", blk("Themen für Flair: News - EN"),
+    ))
+    # Events
+    grids.append(_pair_card(
+        "Events – DE", blk("Themen für Flair: Events - DE"),
+        "Events – EN", blk("Themen für Flair: Events - EN"),
+    ))
+    # Frage/Advice
+    grids.append(_pair_card(
+        "Frage/Advice – DE", blk("Themen für Flair: Frage/Advice - DE"),
+        "Frage/Advice – EN", blk("Themen für Flair: Frage/Advice - EN"),
+    ))
+    return "\n".join(grids)
+
+def _stats_card(sections):
+    """Kleine Statistik über Doks/Features je Block."""
+    rows = []
+    rows.append("<table class='tbl'><thead><tr><th>Block</th><th>Dok.</th><th>EN kept</th><th>K</th><th>Coh</th><th>Features</th></tr></thead><tbody>")
+    wanted = [
+        ("Diskussion – DE", "Themen für Flair: Diskussion - DE"),
+        ("Diskussion – EN", "Themen für Flair: Diskussion - EN"),
+        ("News – DE", "Themen für Flair: News - DE"),
+        ("News – EN", "Themen für Flair: News - EN"),
+        ("Events – DE", "Themen für Flair: Events - DE"),
+        ("Events – EN", "Themen für Flair: Events - EN"),
+        ("Frage/Advice – DE", "Themen für Flair: Frage/Advice - DE"),
+        ("Frage/Advice – EN", "Themen für Flair: Frage/Advice - EN"),
+    ]
+    for label, key in wanted:
+        topics, k_info, docs, kept_en = _parse_block(sections.get(key, []))
+        en_txt = f"{kept_en[0]}/{kept_en[1]}" if kept_en else "–"
+        rows.append(
+            f"<tr><td>{_html.escape(label)}</td>"
+            f"<td>{docs if docs is not None else '–'}</td>"
+            f"<td>{en_txt}</td>"
+            f"<td>{_html.escape(k_info.get('K') or '–')}</td>"
+            f"<td>{_html.escape(k_info.get('Coh') or '–')}</td>"
+            f"<td>{_html.escape(k_info.get('features') or '–')}</td></tr>"
+        )
+    rows.append("</tbody></table>")
+    return "<div class='card'><h2>Statistik</h2>" + "\n".join(rows) + "</div>"
+
+def _try_read_table_csv(path: Path, title: str):
+    try:
+        if path.exists():
+            df = _pd.read_csv(path)
+            return f"<div class='card'><h2>{_html.escape(title)}</h2>{df.to_html(index=False, border=0, classes='tbl')}</div>"
+    except Exception:
+        pass
+    return f"<div class='card'><h2>{_html.escape(title)}</h2><div class='muted'>keine Tabelle gefunden</div></div>"
+
+def _write_html_report_from_text(captured_text: str, outpath: Path):
+    """Schreibt einen hübschen HTML-Report:
+       - Top Flairs & Top User als Tabellen
+       - pro Flair (Diskussion/News/Events/Frage) je DE/EN nebeneinander als Topics-Tabellen
+       - Statistik-Card
+       - ganz unten: kompletter Konsolen-Output (Roh-Log)
+    """
+    sections = _split_sections(captured_text)
+
+    flairs_html = _try_read_table_csv(Path(DATA_DIR) / "top_flairs.csv", "Top Flairs")
+    users_html  = _try_read_table_csv(Path(DATA_DIR) / "top_users.csv",  "Top User")
+
+    topic_grids = _build_topic_grids(sections)
+    stats_html  = _stats_card(sections)
+
+    # kompletter Roh-Log (wie bisher)
+    raw_log = _html.escape(captured_text)
+
+    html_doc = f"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>r/Stuttgart – Themenreport</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {{
+    --bg:#0b1020; --card:#121a2d; --text:#e8eefc; --muted:#93a1c8; --accent:#5aa7ff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, "Helvetica Neue", Arial;
+  }}
+  body {{ background: var(--bg); color: var(--text); font-family: var(--sans); margin: 0; }}
+  header {{ padding: 24px; border-bottom: 1px solid #1f2942; background: #0e1530; }}
+  header h1 {{ margin: 0; font-size: 22px; letter-spacing: .2px; }}
+  main {{ padding: 24px; }}
+  .card {{ background: var(--card); border: 1px solid #1f2942; border-radius: 14px; padding: 18px; margin-bottom: 18px; }}
+  h2, h3 {{ margin: 0 0 12px 0; font-weight: 600; }}
+  .muted {{ color: var(--muted); }}
+  .grid2 {{ display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }}
+  .grid12 {{ display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }}
+  table.tbl {{ width: 100%; border-collapse: collapse; margin-top: 6px; }}
+  table.tbl thead th {{ text-align: left; color: var(--muted); font-weight: 600; border-bottom: 1px solid #223056; padding: 8px; }}
+  table.tbl tbody td {{ border-bottom: 1px solid #1a2544; padding: 8px; vertical-align: top; }}
+  pre {{ background: #0b1329; border: 1px solid #1f2942; border-radius: 10px; padding: 12px; overflow:auto; white-space: pre-wrap; font-family: var(--mono); }}
+</style>
+</head>
+<body>
+<header>
+  <h1>r/Stuttgart – Themenreport</h1>
+  <div class="muted">Automatisch generiert</div>
+</header>
+<main>
+  <div class="grid12">
+    {flairs_html}
+    {users_html}
+  </div>
+
+  {stats_html}
+
+  <div class="card">
+    <h2>Topics nach Flair (DE/EN nebeneinander)</h2>
+    {topic_grids}
+  </div>
+
+  <div class="card">
+    <h2>Roh-Log (Konsolen-Output)</h2>
+    <pre>{raw_log}</pre>
+  </div>
+</main>
+</body>
+</html>"""
+    outpath.write_text(html_doc, encoding="utf-8")
+    print(f"[Info] HTML-Report gespeichert: {outpath}")
+
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
-    main()
+
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main()
+    captured = buf.getvalue()
+    print(captured, end="")  # Konsole wie bisher
+    REPORT_PATH = (DATA_DIR / "report.html")
+    _write_html_report_from_text(captured, REPORT_PATH)
