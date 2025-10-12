@@ -41,7 +41,7 @@ Der Report zeigt u. a. die aktivsten Flairs und Nutzer:innen, pro Flair die Top-
 ## About The Project
 
 Dieses Projekt crawlt Posts und (optional) Kommentare aus **r/Stuttgart**, bereitet die Texte auf, erzeugt **pro Flair** eigene Themenmodelle (LDA), vergibt **aussagekräftige Labels** (inkl. Duplikat-Vermeidung) und baut daraus einen kompakten, modernen **HTML-Report**.  
-Der Report stellt **DE/EN-Ergebnisse je Flair nebeneinander**, ergänzt um eine **Statistik-Karte** (Dokumentanzahl, Features, K, Kohärenz) sowie **Tabellen zu Flairs & Top-Usern**. Ganz unten findest du den **vollständigen Konsolen-Output**.
+Der Report stellt **DE/EN-Ergebnisse je Flair nebeneinander**, ergänzt um eine **Statistik-Karte** (Dokumentanzahl, Features, K, Kohärenz) sowie **Tabellen zu Flairs & Top-Usern**. Ganz unten findet man zusätzlich den **vollständigen Konsolen-Output**.
 
 ### Built With
 
@@ -140,7 +140,7 @@ FLAIR_RUNS = [
 ]
 ```
 
-**Hinweis zu Kohärenz**: Negative Kohärenzwerte sind bei dünnen, kurzen Reddit-Texten nicht unüblich. Entscheidend ist die **Vergleichbarkeit** innerhalb desselben Blocks (z. B. Auswahl von K und Seeds).
+**Hinweis zu Kohärenz**: Negative Kohärenzwerte sind bei dünnen, kurzen Reddit-Texten nicht unüblich.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -166,37 +166,9 @@ Standard-Verzeichnis: `data/` (siehe `DATA_DIR` in `src/utils.py`).
 
 ---
 
-## Roadmap
-
-- [ ] Interaktive Report-Ansicht (Filter/Collapse)
-- [ ] Persistenz für Topic-Historie (Zeitreihen)
-- [ ] Optionale Stemming/POS-Filter als Switch
-- [ ] Export nach Markdown/PDF
-- [ ] Unit-Tests für Preprocessing & Labeling
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
----
-
 ## Contributing
 
 Pull Requests und Issues sind willkommen — kurze Beschreibung, reproduzierbare Beispiele und, wenn möglich, kleine Test-Snippets helfen sehr.
-
-**Standard-Flow:**
-1. Forken  
-2. Feature-Branch erstellen (`git checkout -b feature/awesome`)  
-3. Committen (`git commit -m "Add awesome"`)  
-4. Pushen (`git push origin feature/awesome`)  
-5. PR öffnen
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
----
-
-## License
-
-Distributed under the **Unlicense**. Siehe `LICENSE.txt` für Details.  
-*(Gerne anpassen, falls du eine andere Lizenz bevorzugst.)*
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -204,7 +176,7 @@ Distributed under the **Unlicense**. Siehe `LICENSE.txt` für Details.
 
 ## Contact
 
-Maintainer: **Joshua Wolf**  
+Projekt wird nicht weiterentwickelt. 
 Project Link: https://github.com/Aalkfk/dlbdseda02_d/tree/main
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
@@ -217,6 +189,5 @@ Project Link: https://github.com/Aalkfk/dlbdseda02_d/tree/main
 - PRAW (Python Reddit API Wrapper)  
 - tqdm  
 - python-dotenv  
-- Struktur angelehnt an bekannte README-Templates
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
